@@ -25,6 +25,9 @@
 #define StarLab_Malloc 4
 #define StarLab_Realloc 5
 #define StarLab_Calloc 6
+#define StarLab_New 7
+#define StarLab_New_Array 8
+
 
 using namespace llvm;
 
@@ -36,17 +39,16 @@ namespace {
         virtual bool runOnFunction(Function &F){
             Module *M = F.getParent();
             /* 若当前方法是 main 方法，则在 main 方法的前面添加一条call 指令初始化函数 */
-            
             std::string funcName = F.getName().str();
             if(funcName == "main"){
                 Function *StarLab_Log_init = cast<Function>(M->getOrInsertFunction("StarLab_init", Type::getVoidTy(M->getContext()), NULL));
                 IRBuilder<> IRB(F.front().getFirstInsertionPt());
-               IRB.CreateCall(StarLab_Log_init);
+                IRB.CreateCall(StarLab_Log_init);
             }
             IntegerType *Type_Int64 = Type::getInt64Ty(M->getContext());
             
-            for(Function::iterator basicblock = F.begin(); basicblock != F.end(); ++basicblock){
-                for(BasicBlock::iterator instruction = basicblock->begin(); instruction != basicblock->end(); ++instruction){      
+            for(Function::iterator basicblock = F.begin(); basicblock != F.end(); basicblock++){
+                for(BasicBlock::iterator instruction = basicblock->begin(); instruction != basicblock->end(); instruction++){      
                     // 获取当前指令在源码中的行号
                     int lineNo = StarLab_getLineNo(instruction);
                     
@@ -79,7 +81,11 @@ namespace {
         void StarLab_handleCallInstruction(Instruction *instruction, int lineNo, Function *function){
             
             CallInst *CI = dyn_cast<CallInst>(instruction);
-            std::string funcName = CI->getCalledFunction()->getName().str();
+            Function *callFunction = CI->getCalledFunction();
+            if(!callFunction){
+                return;
+            }
+            std::string funcName = callFunction->getName().str();
             TerminatorInst *TInst = instruction->getParent()->getTerminator();
             IRBuilder<> IRB(TInst);
             Value *line = ConstantInt::get(IRB.getInt64Ty(), lineNo);
@@ -101,7 +107,19 @@ namespace {
                 Value *addr = IRB.CreatePtrToInt(instruction, IRB.getInt64Ty());
                 Value *args[] = {type, len, addr, line};
                 IRB.CreateCall(function, args);
-            }
+            }else if(funcName == "_Znam"){
+                Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_New_Array);
+                Value *len = instruction->getOperand(0);
+                Value *addr = IRB.CreatePtrToInt(instruction, IRB.getInt64Ty());
+                Value *args[] = {type, len, addr, line};
+                IRB.CreateCall(function, args);
+	        }else if(funcName == "_Znwm"){
+		        Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_New);
+                Value *len = instruction->getOperand(0);
+                Value *addr = IRB.CreatePtrToInt(instruction, IRB.getInt64Ty());
+                Value *args[] = {type, len, addr, line};
+                IRB.CreateCall(function, args);
+	        }
         }
 
          /* 
@@ -110,15 +128,13 @@ namespace {
           *     type:  表示是 LLVM Alloca 指令产生的地址
           *     len :  所申请内存地址的长度
           *     addr:  申请地址空间首地址
-          *     line:  源码的行号
           */
         void StarLab_handleAllocaInstruction(Instruction *instruction, int lineNo, Function *function){
             TerminatorInst *TInst = instruction->getParent()->getTerminator();
             IRBuilder<> IRB(TInst);
-            Value *line = ConstantInt::get(IRB.getInt64Ty(), lineNo);
+            Value *len = ConstantInt::get(IRB.getInt64Ty(), StarLab_getLengthOfData(instruction));
             Value *address = IRB.CreatePtrToInt(instruction, IRB.getInt64Ty());
-            Value *args[] = {address, line};
-            // SmallVector<Value *, 2> assertArgs;
+            Value *args[] = {len, address};
             IRB.CreateCall(function, args);
         }
 
@@ -171,8 +187,10 @@ namespace {
         int StarLab_getLineNo(Instruction *instruction){
             if (MDNode *N = instruction->getMetadata("dbg")) {
                 DILocation Loc(N);
+                std::string file = Loc.getFilename();
+                std::string dir = Loc.getDirectory();
                 return Loc.getLineNumber();
-            } 
+            }
             return -1;
         }
 
