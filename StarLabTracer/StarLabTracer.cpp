@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <fstream>
 #include <string>
+#include <algorithm>
 
 #define StarLab_Load_Global 0
 #define StarLab_Load_Not_Global 1
@@ -28,12 +29,14 @@
 #define StarLab_New 7
 #define StarLab_New_Array 8
 
+#define StarLab_Free 9
 
 using namespace llvm;
 
 namespace {
     struct  StarLabTracer : public FunctionPass{
         static char ID;
+        std::vector<Value*> vec;
         StarLabTracer() : FunctionPass(ID){}
         
         virtual bool runOnFunction(Function &F){
@@ -51,23 +54,27 @@ namespace {
                 for(BasicBlock::iterator instruction = basicblock->begin(); instruction != basicblock->end(); instruction++){      
                     // 获取当前指令在源码中的行号
                     int lineNo = StarLab_getLineNo(instruction);
-                    
+                    Function *StarLab_trace = cast<Function>(
+                                M->getOrInsertFunction("StarLab_trace", Type::getVoidTy(M->getContext()), Type_Int64, Type_Int64, Type_Int64, Type_Int64, NULL));
                     if(isa<CallInst>(instruction)){
-                        Function *StarLab_log_Call = cast<Function>(
-                                M->getOrInsertFunction("StarLab_call", Type::getVoidTy(M->getContext()), Type_Int64, Type_Int64, Type_Int64, Type_Int64, NULL));
-                        StarLab_handleCallInstruction(instruction, lineNo, StarLab_log_Call);
-                    }else if (isa<AllocaInst>(instruction)) { 
-                        Function *StarLab_log_Alloca = cast<Function>(
-                            M->getOrInsertFunction("StarLab_alloca", Type::getVoidTy(M->getContext()), Type_Int64, Type_Int64, NULL));
-                        StarLab_handleAllocaInstruction(instruction, lineNo, StarLab_log_Alloca);
+                        StarLab_handleCallInstruction(instruction, lineNo, StarLab_trace);
+                    }else if(isa<GetElementPtrInst>(instruction)){
+                        // 处理 GemElementPtr 指令
+                        StarLab_handleGetElementPtrInstruction(instruction);
                     }else{
-                        Function *StarLab_log_Load_and_Store = cast<Function>(
-                            M->getOrInsertFunction("StarLab_load_and_store", Type::getVoidTy(M->getContext()), Type_Int64, Type_Int64, Type_Int64, Type_Int64, NULL));
-                        StarLab_handleLoadAndStoreInstruction(instruction, lineNo, StarLab_log_Load_and_Store);
+                        StarLab_handleLoadAndStoreInstruction(instruction, lineNo, StarLab_trace);
                     } 
                 }
             }
             return true;
+        }
+        /**
+         * 处理 GetElementPtr 指令 
+         * 将该指令中访问的地址添加到 vec 容器中
+         */
+        void StarLab_handleGetElementPtrInstruction(Instruction *instruction){
+            GetElementPtrInst *gepInst = dyn_cast<GetElementPtrInst>(instruction);
+            vec.push_back(gepInst);
         }
 
          /* 
@@ -93,33 +100,48 @@ namespace {
                 Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Malloc);
                 Value *len = instruction->getOperand(0);
                 Value *addr = IRB.CreatePtrToInt(instruction, IRB.getInt64Ty());
+                vec.push_back(instruction);
                 Value *args[] = {type, len, addr, line};
                 IRB.CreateCall(function, args);
             }else if(funcName == "realloc"){
                 Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Realloc);
                 Value *len = instruction->getOperand(1);
                 Value *addr = IRB.CreatePtrToInt(instruction, IRB.getInt64Ty());
+                vec.push_back(instruction);
                 Value *args[] = {type, len, addr, line};
                 IRB.CreateCall(function, args);
             }else if(funcName == "calloc"){
                 Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Calloc);
                 Value *len = IRB.CreateMul(instruction->getOperand(0), instruction->getOperand(1));
                 Value *addr = IRB.CreatePtrToInt(instruction, IRB.getInt64Ty());
+                vec.push_back(instruction);
                 Value *args[] = {type, len, addr, line};
                 IRB.CreateCall(function, args);
             }else if(funcName == "_Znam"){
                 Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_New_Array);
                 Value *len = instruction->getOperand(0);
                 Value *addr = IRB.CreatePtrToInt(instruction, IRB.getInt64Ty());
+                vec.push_back(instruction);
                 Value *args[] = {type, len, addr, line};
                 IRB.CreateCall(function, args);
 	        }else if(funcName == "_Znwm"){
 		        Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_New);
                 Value *len = instruction->getOperand(0);
                 Value *addr = IRB.CreatePtrToInt(instruction, IRB.getInt64Ty());
-                Value *args[] = {type, len, addr, line};
+                vec.push_back(instruction);
+                Value *args[] = { type, len, addr, line};
                 IRB.CreateCall(function, args);
-	        }
+	        }else if(funcName == "free" || funcName == "_ZdlPv" || funcName == "_ZdaPv"){
+                if(find(vec.begin(), vec.end(), instruction->getOperand(0)) != vec.end()){
+                    // 在 vec 容器中查找操作地址是否存在，若存在，则删除该元素
+                    vec.erase(find(vec.begin(), vec.end(), instruction->getOperand(0)));
+                    Value *address = IRB.CreatePtrToInt(instruction->getOperand(0), IRB.getInt64Ty());
+                    Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Free);
+                    Value *len = ConstantInt::get(IRB.getInt64Ty(), 0);
+                    Value *args[] = {type, len, address, line};
+                    IRB.CreateCall(function, args);
+                }
+            }
         }
 
          /* 
@@ -157,29 +179,40 @@ namespace {
                     return;
                 Value *pointer = load->getPointerOperand();
                 if(isa<GlobalVariable>(pointer)){
-                    type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Load_Global);
+                    Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Load_Global);
+                    Value *len = ConstantInt::get(IRB.getInt64Ty(), 64);
+                    Value *address = IRB.CreatePtrToInt(instruction->getOperand(0), IRB.getInt64Ty());
+                    Value *args[] = {type, len, address, line};
+                    IRB.CreateCall(function, args); 
                 }else{
-                    type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Load_Not_Global);
+                    if(find(vec.begin(), vec.end(), instruction->getOperand(0)) != vec.end()){
+                        Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Load_Not_Global);
+                        Value *len = ConstantInt::get(IRB.getInt64Ty(), 64);
+                        Value *address = IRB.CreatePtrToInt(instruction->getOperand(0), IRB.getInt64Ty());
+                        Value *args[] = {type, len, address, line};
+                        IRB.CreateCall(function, args); 
+                    }
                 }
-                
-                Value *len = ConstantInt::get(IRB.getInt64Ty(), 64);
-                Value *address = IRB.CreatePtrToInt(instruction->getOperand(0), IRB.getInt64Ty());
-                Value *args[] = {type, len, address, line};
-                IRB.CreateCall(function, args);
             }else if(instruction->getOpcode() == Instruction::Store){
                 StoreInst *store = dyn_cast<StoreInst>(instruction);
                 if(!store)
                     return;
                 Value *pointer = store->getPointerOperand();
                 if(isa<GlobalVariable>(pointer)){
-                    type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Store_Global);
+                    Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Store_Global);
+                    Value *len = ConstantInt::get(IRB.getInt64Ty(), 64);
+                    Value *address = IRB.CreatePtrToInt(instruction->getOperand(1), IRB.getInt64Ty());
+                    Value *args[] = {type, len, address, line};
+                    IRB.CreateCall(function, args);
                 }else{
-                    type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Store_Not_Global);
+                    if(find(vec.begin(), vec.end(), instruction->getOperand(1)) != vec.end()){
+                        Value *address = IRB.CreatePtrToInt(instruction->getOperand(1), IRB.getInt64Ty());
+                        Value *type = ConstantInt::get(IRB.getInt64Ty(), StarLab_Store_Not_Global);
+                        Value *len = ConstantInt::get(IRB.getInt64Ty(), 64);
+                        Value *args[] = {type, len, address, line};
+                        IRB.CreateCall(function, args);
+                    }
                 }
-                Value *len = ConstantInt::get(IRB.getInt64Ty(), 64);
-                Value *address = IRB.CreatePtrToInt(instruction->getOperand(1), IRB.getInt64Ty());
-                Value *args[] = {type, len, address, line};
-                IRB.CreateCall(function, args);
             }
         }
 
